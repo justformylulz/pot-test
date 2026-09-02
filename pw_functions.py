@@ -1,7 +1,9 @@
 #General imports
 import os
 import copy
+import sys
 import time
+import math
 import fnmatch
 import subprocess
 from invoke import run
@@ -20,9 +22,22 @@ from ase.units import Rydberg, Bohr
 from ase.units import _amu
 
 
+
+
+
 #################################
 ######  START OF run_pw() #######
 #################################
+
+class Logger:
+    def __init__(self, logfile=sys.stdout):
+        self.logfile = logfile
+
+    def __call__(self, *args, **kwargs):
+        if self.logfile is not None:
+            print(*args, file=self.logfile, **kwargs)
+
+
 
 # INPUTS:
 #### atoms = structure as ASE_Atoms 
@@ -136,7 +151,7 @@ def is_nested(dic):
 #
 
 
-def read_pw_jobs(jobs, poll_interval=5):
+def read_pw_jobs(jobs, poll_interval=3):
     #Wait for a SLURM QE job to finish and verify JOB DONE
     jobid_list=[]
     dirs_list=[]
@@ -211,7 +226,7 @@ def get_kpoint_mesh(atoms, k_per_inv_A=26, k_thresh=13):
         if cell_lengths[i] >= k_thresh:
              k_mesh[i] = 1
         else:
-            k_mesh[i] = math.ceil(k_mesh[i] / 2) * 2
+            k_mesh[i] = math.floor(k_mesh[i] / 2) * 2
         
     return k_mesh
 
@@ -223,7 +238,7 @@ def get_kpoint_mesh(atoms, k_per_inv_A=26, k_thresh=13):
 
 def run_vc_relax_until_converged(strucs_dict, base_input_data, pseudopotentials,
                                   calc_base_dir, runbatch_path, vdW_path=None,
-                                  max_restarts=8, poll_interval=30, logfile=sys.stdout):
+                                  max_restarts=8, poll_interval=3, logfile=sys.stdout):
     """
     Repeatedly runs vc_relax on every structure in strucs_dict, feeding each
     restart's relaxed geometry back in as the next restart's starting point,
@@ -301,9 +316,11 @@ def run_vc_relax_until_converged(strucs_dict, base_input_data, pseudopotentials,
             images = read(out_file, index=':', format='espresso-out')
             current_atoms[name] = images[-1]  # always carry the latest geometry forward
 
-            if len(images) == 1:
+            if len(images) <= 2:
                 converged[name] = True
-                results[name] = images[-1]
+                results[name] = { 'ase_atoms' : images[-1],
+                                  'potential_energy' : images[-1].get_potential_energy(),
+                                  'forces' : images[-1].get_forces()}
                 log(f"  {name}: converged after {restart + 1} restart(s).")
             else:
                 log(f"  {name}: {len(images)} ionic/cell steps this round, restarting.")

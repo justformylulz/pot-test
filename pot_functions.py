@@ -110,24 +110,28 @@ def angle_between_vectors(v1, v2):
 
 
 def substitute_atoms(atoms, elements_list):
-    
-    symbols = atoms.get_chemical_symbols()
-    counts = list(Counter(symbols))
 
-    if len(counts) != len(elements_list):
+    symbols = atoms.get_chemical_symbols()
+    counts = Counter(symbols)
+
+    # sort elements by how many atoms of each there are (ascending),
+    # so A is always the least abundant element, B next, etc.
+    # tie-break alphabetically so equal counts are still deterministic
+    elements = sorted(counts, key=lambda el: (counts[el], el))
+
+    if len(elements) != len(elements_list):
         raise ValueError(
             f"Expected {len(elements_list)} elements, got {dict(counts)}"
         )
 
-    new_symbols=[]
-    for s in symbols:
-        elem_index = counts.index(s)
-        new_symbols.append(elements_list[elem_index])
+    # map each original element symbol to its replacement,
+    # e.g. {'O': 'O', 'Li': 'Li'} for an AB2 structure with elements_list=['O', 'Li']
+    elem_map = dict(zip(elements, elements_list))
 
+    new_symbols = [elem_map[s] for s in symbols]  # replace every atom using the map
 
     new_atoms = atoms.copy()
     new_atoms.set_chemical_symbols(new_symbols)
-
     return new_atoms
 
 
@@ -822,7 +826,7 @@ def get_opt_alat(atoms,logfile=sys.stdout):
     lattice_type = lattice['type']
 
     if lattice_type == 'CUB': #cubic
-        for i in range(-10, 10, 1): #volume opt, -2.5% - +2.5% in 0.25% steps
+        for i in range(-14, 15, 1): #volume opt, -2.3% - +2.3% in 0.25% steps
             j=(i/4)/100
             a_new = a+a*j
             dmp_atoms.set_cell([a_new, a_new, a_new], scale_atoms=True)
@@ -835,7 +839,7 @@ def get_opt_alat(atoms,logfile=sys.stdout):
         return a_opt
 
     elif lattice_type == 'HEX': #hexagonal
-        for i in range(-10, 10, 1): #volume opt, -2.5% - +2.5% in 0.25% steps
+        for i in range(-15, 15, 1): #volume opt, -3.5% - +3.5% in 0.25% steps
             j=(i/4)/100
             a_new = a+a*j
             dmp_atoms.set_cell([a_new, a_new, ca_ratio*a_new, 90, 90, 120], scale_atoms=True)
@@ -849,7 +853,7 @@ def get_opt_alat(atoms,logfile=sys.stdout):
         alat_list=[]
         e_list=[]
 
-        for i in range(-10, 10, 1): #c opt, -2.5% - +2.5% in 0.25% steps
+        for i in range(-14, 15, 1): #c opt, -3.5% - +3.5% in 0.25% steps
             j=(i/4)/100
             c_dmp = ca_ratio*a_opt
             c_new = c_dmp + c_dmp*j
