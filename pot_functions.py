@@ -397,85 +397,183 @@ def find_stable_surface(atoms, h, k, l, nrep, periodic=True, opt=True, logfile=s
 ########################################################
 
 ##########################################
-####### START OF get_bulk_ref_e()  #######
+######## START OF get_bulk_ref() #########
 ##########################################
 
 #### INPUTS:
-# dict of (optimized) bulk structures.
-# this dict has to also include 
-# the reference structure of gas phase molecules
-# Example: Li-O systems -> O2 molecule has to be included
-#### What it does:
-# takes the highest energy/atom values for each element
-# of your passed dictionary as reference energy
-# 
-# returns a dictionary that has the Element Symbol and the corresponding energy/atom as entries
-# dict_dmp = {
-############## 'elem1' : energy per atom
-############## 'elem2' : energy per atom
-############## ....
-############## 'elemN' : energy per atom
-############## }
+# structures : the reference structures to build per-element reference
+#              energies from. Two input styles are accepted, so this works
+#              both with raw ASE output and with the {name: {'ase_atoms': ...}}
+#              dicts used elsewhere in this file:
+#                 - a list (or tuple) of ase.Atoms objects, OR
+#                 - a dict of {name: {'ase_atoms': atoms_obj}}
+#              Every Atoms object must already have a calculator attached
+#              (so .get_potential_energy() works) and must contain ONLY ONE
+#              element -- e.g. bulk Li metal, an O2 molecule, bulk Na, an
+#              S8 ring, ... This is not Li-O specific: hand it whatever
+#              single-element reference structures your system needs and it
+#              will build the dict for exactly those elements.
+#
+#### WHAT IT DOES:
+# For every element found across the structures you pass in, this keeps
+# the LOWEST energy-per-atom structure as the reference (i.e. the most
+# stable form you gave it, e.g. bulk metal for Li, O2 molecule for O).
+# This is the standard reference-state choice for formation-energy /
+# phase-diagram calculations.
+# Structures containing more than one element are skipped (with a
+# logged warning) since they can't serve as an elemental reference.
+#
+#### RETURNS:
+# element_ref_dict : dict formatted so it can be used directly wherever
+#                     you'd otherwise write a manual element_refs dict:
+#   element_ref_dict = {
+#       'Li': (Composition('Li2'), -3.80),   # TOTAL energy of the whole structure
+#       'O' : (Composition('O2'),  -9.86),
+#       ...
+#   }
+# 'energy' is the TOTAL energy of the reference structure (not per atom) --
+# exactly what PDEntry(composition=..., energy=...) expects, e.g.:
+#
+#   element_mlp_ref = get_bulk_ref(bulk_dict)
+#   for element, (composition, energy) in element_mlp_ref.items():
+#       entries.append(PDEntry(composition=composition, energy=energy))
 
-def get_bulk_ref_e(bulk_dict):
+def get_bulk_ref(structures, logfile=sys.stdout):
+    log = Logger(logfile)
 
-    dict_dmp = {}
+    # accept either a plain list/tuple of Atoms, or the {name: {'ase_atoms': ..}}
+    # dict style used elsewhere in this file -- normalize to a simple list
+    if isinstance(structures, dict):
+        atoms_list = [structures[name]['ase_atoms'] for name in structures]
+    else:
+        atoms_list = list(structures)
 
-    energy_list = [
-    [name, bulk_dict[name]['ase_atoms'].get_potential_energy() / len(bulk_dict[name]['ase_atoms'])  ]
-    for name in bulk_dict
-    ]
+    # for each element, remember the (atoms, energy_per_atom) of the most
+    # stable structure seen so far
+    best_atoms_per_element = {}
 
-    energies_list = sorted(energy_list, key=lambda x: x[1], reverse=True)
+    for atoms in atoms_list:
+        symbols = set(atoms.get_chemical_symbols())
 
-    for i in energies_list:
-        element = bulk_dict[i[0]]['ase_atoms'].get_chemical_symbols()[0]
-        
-        if element in dict_dmp:
+        if len(symbols) != 1:
+            log(f"Skipping {atoms.get_chemical_formula()}: not a single-element "
+                f"structure, can't use it as an elemental reference.")
             continue
-        else:
-            dict_dmp[element]= bulk_dict[i[0]]['ase_atoms'].get_potential_energy() / len(bulk_dict[name]['ase_atoms'])
 
+        element = symbols.pop()
+        energy_per_atom = atoms.get_potential_energy() / len(atoms)
 
-    return dict_dmp
+        if (element not in best_atoms_per_element
+                or energy_per_atom < best_atoms_per_element[element][1]):
+            best_atoms_per_element[element] = (atoms, energy_per_atom)
+
+    if not best_atoms_per_element:
+        log("No valid single-element structures found -- returning empty dict!")
+        return {}
+
+    # convert the winning ASE structures into the final
+    # {element: (Composition, total_energy)} format
+    element_ref_dict = {}
+    for element, (atoms, energy_per_atom) in best_atoms_per_element.items():
+        structure = AseAtomsAdaptor.get_structure(atoms)
+        total_energy = atoms.get_potential_energy()
+        element_ref_dict[element] = (structure.composition, total_energy)
+        log(f"{element} reference: {structure.composition.reduced_formula} "
+            f"({total_energy:.4f} eV total, {energy_per_atom:.4f} eV/atom)")
+
+    return element_ref_dict
+
 ##########################################
-####### END OF get_bulk_ref_e()  #########
+######### END OF get_bulk_ref() ##########
 ##########################################
-
 
 ##########################################
 #### START OF get_formation_energy()  ####
 ##########################################
 
 #### INPUTS:
-# ASE.Atoms (optimized structure)
-# dictionary of reference elemental bulk energies
+# structures    : the structure(s) to compute a formation energy for.
+#                 Three input styles are accepted (same convention as
+#                 get_bulk_ref() above):
+#                    - a single ase.Atoms object
+#                    - a list (or tuple) of ase.Atoms objects
+#                    - a dict of {name: {'ase_atoms': atoms_obj}}
+# ref_bulk_dict : the elemental reference dict, straight from
+#                 get_bulk_ref(): {element: (Composition, total_energy)}
+# logfile       : where to print warnings, default sys.stdout
+#
+#### WHAT IT DOES:
+# For every structure passed in, computes the formation energy per formula
+# unit:
+#   E_f = E[structure]/n_units - sum_i( x_i * mu_i )
+# where mu_i is the per-atom reference (chemical potential) energy of
+# element i (taken from ref_bulk_dict), x_i is how many atoms of element i
+# sit in one formula unit, and n_units is the number of formula units in
+# the structure (atoms.info['n_units'] if you set it, otherwise the total
+# atom count is used as a fallback, i.e. you get formation energy PER ATOM
+# instead). Works for any elements/compounds, not just Li-O.
+#
 #### RETURNS:
-# formation energy
+# a single float if you passed in a single ase.Atoms object, otherwise a
+# dict of {key: formation_energy} -- one entry per structure. For a list
+# input, key = "<index>_<chemical formula>"; for a dict input, key = the
+# same name you used in that dict.
 
-def get_formation_energy(atoms, ref_bulk_dict,  logfile=sys.stdout):
+def get_formation_energy(structures, ref_bulk_dict, logfile=sys.stdout):
     log = Logger(logfile)
 
-    if 'n_units' in atoms.info:
-        n_units = atoms.info['n_units']
+    # normalize the different accepted input styles into one
+    # {key: atoms} dict to loop over. Remember if a single bare Atoms
+    # object was passed in, so we can return a plain float in that case
+    # (keeps this backwards-compatible with the old single-structure use).
+    single_structure = False
+    if isinstance(structures, dict):
+        atoms_by_key = {name: structures[name]['ase_atoms'] for name in structures}
+    elif isinstance(structures, (list, tuple)):
+        atoms_by_key = {f"{i}_{atoms.get_chemical_formula()}": atoms
+                         for i, atoms in enumerate(structures)}
     else:
-        n_units = len(atoms)
-        log("No number of units given, taking total number of atoms instead!")
-    atoms.calc=calc
-    en_unit = atoms.get_potential_energy() / n_units
-    counts = Counter(atoms.get_chemical_symbols())
-    ref_e = 0
-    for element in counts:
-        ref_e = ref_e + ( (counts[element]/n_units) * ref_bulk_dict[element] )
-    
-    Ef = en_unit - ref_e
-    
-    return Ef
+        single_structure = True
+        atoms_by_key = {'structure': structures}
+
+    results = {}
+    for key, atoms in atoms_by_key.items():
+
+        if 'n_units' in atoms.info:
+            n_units = atoms.info['n_units']
+        else:
+            n_units = len(atoms)
+            log(f"{key}: no n_units given, taking total number of atoms instead!")
+
+        atoms.calc = calc
+        en_unit = atoms.get_potential_energy() / n_units
+
+        counts = Counter(atoms.get_chemical_symbols())
+
+        # make sure we have a reference energy for every element in this
+        # structure BEFORE using ref_bulk_dict -- a bare KeyError here
+        # would be confusing, so fail loudly and say exactly what's missing
+        missing = [el for el in counts if el not in ref_bulk_dict]
+        if missing:
+            raise ValueError(
+                f"get_formation_energy: no reference energy found for "
+                f"{missing} in ref_bulk_dict (make sure get_bulk_ref() was "
+                f"given a reference structure for every element in '{key}')."
+            )
+
+        ref_e = 0
+        for element, n_atoms in counts.items():
+            composition, total_energy = ref_bulk_dict[element]
+            mu = total_energy / composition.num_atoms   # reference energy PER ATOM
+            ref_e += (n_atoms / n_units) * mu
+
+        results[key] = en_unit - ref_e
+
+    return results['structure'] if single_structure else results
 
 ##########################################
 #### END OF get_formation_energy()  ######
 ##########################################
-
 
 
 

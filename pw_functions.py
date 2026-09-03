@@ -236,6 +236,7 @@ def get_kpoint_mesh(atoms, k_per_inv_A=26, k_thresh=13):
 
 # --- vc_relax convex-hull workflow: restart-until-converged driver ---
 
+
 def run_vc_relax_until_converged(strucs_dict, base_input_data, pseudopotentials,
                                   calc_base_dir, runbatch_path, vdW_path=None,
                                   max_restarts=8, poll_interval=3, logfile=sys.stdout):
@@ -246,38 +247,43 @@ def run_vc_relax_until_converged(strucs_dict, base_input_data, pseudopotentials,
     i.e. the geometry handed in was already at the minimum for the freshly
     generated plane-wave basis of that cell, so no further restart changes
     anything.
-
-    Returns a dict {name: relaxed ASE.Atoms} for every structure that
-    converged within max_restarts. Structures whose calculation crashed, or
-    that didn't converge within max_restarts, are reported via `log` and
-    simply left out of the returned dict rather than raising.
+ 
+    Returns a dict {index: {'name': ..., 'ase_atoms': ..., 'potential_energy': ...,
+    'forces': ...}} for every structure that converged within max_restarts,
+    where index is just a plain running number (0, 1, 2, ...) in the order
+    structures converged -- NOT tied to the structure's name or its position
+    in strucs_dict. The structure name is stored as a normal property inside
+    each entry instead. Structures whose calculation crashed, or that didn't
+    converge within max_restarts, are reported via `log` and simply left out
+    of the returned dict rather than raising.
     """
     log = Logger(logfile)
-
+ 
     # current_atoms holds each structure's LATEST known geometry -- the
     # starting point for its next restart. converged/n_steps/results track
     # per-structure progress across restart rounds.
     current_atoms = dict(strucs_dict)
     converged = {name: False for name in strucs_dict}
     results = {}
-
+    result_index = 0  # plain running number used as the key in results, bumped each time a structure converges
+ 
     for restart in range(max_restarts):
         # only (re)submit structures that haven't converged yet
         names_this_round = [name for name in current_atoms if not converged[name]]
         if not names_this_round:
             break
-
+ 
         log(f"=== restart round {restart}: {len(names_this_round)} structure(s) to (re)run ===")
-
+ 
         jobs = {}
         for name in names_this_round:
             atoms = current_atoms[name]
-
+ 
             # one directory per structure per restart round, e.g.
             # calc_base_dir/AB2_xyz/restart_0, restart_1, ...
             calc_path = os.path.join(calc_base_dir, name, f"restart_{restart}")
             run(f"mkdir -p {calc_path}")  # -p: name/ and restart_N/ may not exist yet
-
+ 
             input_data = copy.deepcopy(base_input_data)
             # unique prefix per structure+restart, so QE's scratch/output
             # files never collide between structures or between restarts
@@ -285,51 +291,56 @@ def run_vc_relax_until_converged(strucs_dict, base_input_data, pseudopotentials,
             # k-point mesh must be recomputed every restart: the cell (and
             # therefore the appropriate mesh) changes between restarts
             input_data['kpts'] = tuple(int(k) for k in get_kpoint_mesh(atoms))
-
+ 
             jobs[name] = run_pw(atoms, input_data, pseudopotentials, calc_path,
                                  runbatch_path, vdW_path=vdW_path)
-
+ 
         # Block here until every job in this round has left the SLURM queue.
         # read_pw_jobs()'s own return value is not used: it silently drops
         # any job that never printed "JOB DONE", with no indication of WHICH
         # structure that was -- so each OUT file is re-read individually
         # below instead, keyed by structure name.
         read_pw_jobs(jobs, poll_interval=poll_interval)
-
+ 
         for name in names_this_round:
             out_file = os.path.join(calc_base_dir, name, f"restart_{restart}", "OUT")
-
+ 
             if not os.path.exists(out_file):
                 log(f"  {name}: no OUT file found after restart {restart}, will retry.")
                 continue
-
+ 
             with open(out_file) as f:
                 output = f.read()
-
+ 
             if "JOB DONE" not in output:
                 log(f"  {name}: 'JOB DONE' not found after restart {restart}, will retry.")
                 continue
-
+ 
             # ASE returns one image per ionic/cell step vc_relax performed.
             # Exactly one image means QE found the input geometry already
             # converged in its very first SCF cycle -- this structure is done.
             images = read(out_file, index=':', format='espresso-out')
             current_atoms[name] = images[-1]  # always carry the latest geometry forward
-
+ 
             if len(images) <= 2:
                 converged[name] = True
-                results[name] = { 'ase_atoms' : images[-1],
-                                  'potential_energy' : images[-1].get_potential_energy(),
-                                  'forces' : images[-1].get_forces()}
+                # key by a plain number instead of the structure name; name
+                # itself just moves inside the dict as another property,
+                # alongside ase_atoms/potential_energy/forces
+                results[result_index] = { 'name' : name,
+                                          'ase_atoms' : images[-1],
+                                          'potential_energy' : images[-1].get_potential_energy(),
+                                          'forces' : images[-1].get_forces()}
+                result_index += 1  # next structure that converges gets the next number
                 log(f"  {name}: converged after {restart + 1} restart(s).")
             else:
                 log(f"  {name}: {len(images)} ionic/cell steps this round, restarting.")
-
+ 
     still_running = [name for name in current_atoms if not converged[name]]
     if still_running:
         log(f"WARNING: {len(still_running)} structure(s) did not converge within "
             f"{max_restarts} restarts: {still_running}")
-
+ 
     return results
 
 
