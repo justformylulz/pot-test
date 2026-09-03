@@ -5,13 +5,6 @@
 # structure, using the finite-displacement method via phonopy, with forces
 # computed by whatever ASE calculator you've set via
 # pot_functions.set_calculator() (e.g. your PyACECalculator).
-#
-# NEW PACKAGES used here that are NOT already imported in pot_test.ipynb:
-#   - phonopy   (pip install phonopy)
-#   - seekpath  (pulled in automatically as a phonopy dependency; only used
-#                internally by phonopy's auto_band_structure() to find the
-#                correct high-symmetry q-point path for whatever space group
-#                the structure has -- you never call it directly)
 #################################################################
 
 # General imports

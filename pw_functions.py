@@ -256,9 +256,24 @@ def run_vc_relax_until_converged(strucs_dict, base_input_data, pseudopotentials,
     each entry instead. Structures whose calculation crashed, or that didn't
     converge within max_restarts, are reported via `log` and simply left out
     of the returned dict rather than raising.
+
+    After EVERY restart round, the results collected so far are also written
+    to disk as a pandas DataFrame, pickled+gzipped to
+    calc_base_dir/vc_relax_results.pckl.gzip. This way, whatever has already
+    converged is saved even if the notebook/kernel dies partway through --
+    you no longer have to build+pickle the DataFrame yourself after the call
+    returns.
+
+    If a job crashes (QE writes a CRASH file instead of finishing), that is
+    now told apart from "simply not converged yet" in the log. The classic
+    "Not enough space allocated for radial FFT" crash is handled specially:
+    QE's own error message tells you to restart with a larger cell_factor,
+    so this structure's cell_factor is bumped by +2.0 and the same restart
+    round is retried with that larger value -- instead of blindly resubmitting
+    the identical job (which would just crash again the same way).
     """
     log = Logger(logfile)
- 
+
     # current_atoms holds each structure's LATEST known geometry -- the
     # starting point for its next restart. converged/n_steps/results track
     # per-structure progress across restart rounds.
@@ -266,7 +281,16 @@ def run_vc_relax_until_converged(strucs_dict, base_input_data, pseudopotentials,
     converged = {name: False for name in strucs_dict}
     results = {}
     result_index = 0  # plain running number used as the key in results, bumped each time a structure converges
- 
+
+    # cell_factor starts out the same for every structure (whatever
+    # base_input_data says), but gets bumped per-structure if that
+    # structure's job crashes with the "radial FFT too small" error.
+    base_cell_factor = base_input_data.get('cell_factor', 4.0)
+    cell_factor = {name: base_cell_factor for name in strucs_dict}
+
+    # where the running results are (re-)saved after every restart round
+    results_pickle_path = os.path.join(calc_base_dir, "vc_relax_results.pckl.gzip")
+
     for restart in range(max_restarts):
         # only (re)submit structures that haven't converged yet
         names_this_round = [name for name in current_atoms if not converged[name]]
@@ -291,7 +315,11 @@ def run_vc_relax_until_converged(strucs_dict, base_input_data, pseudopotentials,
             # k-point mesh must be recomputed every restart: the cell (and
             # therefore the appropriate mesh) changes between restarts
             input_data['kpts'] = tuple(int(k) for k in get_kpoint_mesh(atoms))
- 
+            # use this structure's own cell_factor -- normally the base
+            # value, but larger if an earlier restart crashed with the
+            # "radial FFT too small" error (see crash handling below)
+            input_data['cell_factor'] = cell_factor[name]
+
             jobs[name] = run_pw(atoms, input_data, pseudopotentials, calc_path,
                                  runbatch_path, vdW_path=vdW_path)
  
@@ -303,19 +331,46 @@ def run_vc_relax_until_converged(strucs_dict, base_input_data, pseudopotentials,
         read_pw_jobs(jobs, poll_interval=poll_interval)
  
         for name in names_this_round:
-            out_file = os.path.join(calc_base_dir, name, f"restart_{restart}", "OUT")
- 
+            calc_path = os.path.join(calc_base_dir, name, f"restart_{restart}")
+            out_file = os.path.join(calc_path, "OUT")
+            crash_file = os.path.join(calc_path, "CRASH")
+
             if not os.path.exists(out_file):
                 log(f"  {name}: no OUT file found after restart {restart}, will retry.")
                 continue
- 
+
             with open(out_file) as f:
                 output = f.read()
- 
+
             if "JOB DONE" not in output:
-                log(f"  {name}: 'JOB DONE' not found after restart {restart}, will retry.")
+                # QE writes a CRASH file when pw.x aborts -- that's a
+                # different situation than "still needs more restarts",
+                # so it gets its own message and (for the FFT case) an
+                # actual fix instead of just resubmitting the same job.
+                if os.path.exists(crash_file):
+                    with open(crash_file) as f:
+                        crash_text = f.read()
+
+                    if "larger cell_factor" in crash_text:
+                        # QE's own error message tells us the fix: the
+                        # radial FFT grid it allocated (based on
+                        # cell_factor) was too small for how much the
+                        # cell grew during this restart. Bump it and
+                        # retry -- otherwise this would crash the exact
+                        # same way every single restart.
+                        cell_factor[name] += 2.0
+                        log(f"  {name}: CRASHED after restart {restart} "
+                            f"(radial FFT grid too small), increasing "
+                            f"cell_factor to {cell_factor[name]} and retrying.")
+                    else:
+                        log(f"  {name}: CRASHED after restart {restart}, "
+                            f"see {crash_file} for details. Retrying with "
+                            f"the same settings.")
+                else:
+                    log(f"  {name}: 'JOB DONE' not found after restart {restart} "
+                        f"(no CRASH file -- job may have hit the walltime), will retry.")
                 continue
- 
+
             # ASE returns one image per ionic/cell step vc_relax performed.
             # Exactly one image means QE found the input geometry already
             # converged in its very first SCF cycle -- this structure is done.
@@ -335,12 +390,19 @@ def run_vc_relax_until_converged(strucs_dict, base_input_data, pseudopotentials,
                 log(f"  {name}: converged after {restart + 1} restart(s).")
             else:
                 log(f"  {name}: {len(images)} ionic/cell steps this round, restarting.")
- 
+
+        # Save whatever has converged so far after every restart round --
+        # if the notebook/kernel dies before the function returns, this
+        # file on disk is the only record of the work done up to now.
+        results_df = pd.DataFrame.from_dict(results, orient='index')
+        results_df.to_pickle(results_pickle_path, compression='gzip', protocol=4)
+        log(f"  (saved {len(results)} converged structure(s) so far to {results_pickle_path})")
+
     still_running = [name for name in current_atoms if not converged[name]]
     if still_running:
         log(f"WARNING: {len(still_running)} structure(s) did not converge within "
             f"{max_restarts} restarts: {still_running}")
- 
+
     return results
 
 
