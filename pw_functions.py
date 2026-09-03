@@ -236,9 +236,36 @@ def get_kpoint_mesh(atoms, k_per_inv_A=26, k_thresh=13):
 
 # --- vc_relax convex-hull workflow: restart-until-converged driver ---
 
+# =============================================================================
+# PATCHED run_vc_relax_until_converged() -- drop-in replacement
+#
+# Paste this over the existing function of the same name in pw_functions.py.
+# Everything else in the file (imports, Logger, run_pw, read_pw_jobs,
+# get_kpoint_mesh, ...) stays exactly as it is -- this function still calls
+# all of those the same way as before.
+#
+# WHAT CHANGED (all marked with "FIX" in the comments below):
+#   1. Added a `failed` dict, parallel to `converged`. A structure that runs
+#      into a broken/unparsable OUT file gets `failed[name] = True` and is
+#      never resubmitted again -- it's simply excluded from the returned
+#      dict, instead of crashing the whole function.
+#   2. The block that reads/parses the OUT file is now wrapped in a
+#      try/except. Any exception there (corrupted OUT, missing forces,
+#      truncated write, ASE parser hiccup, ...) is caught, logged, and that
+#      ONE structure is skipped from then on -- everything else keeps going.
+#   3. Optional `return_failed=True` lets you also get back the list of
+#      disregarded structure names, if you want to know which ones to
+#      re-check by hand later. Default is False, so any of your existing
+#      notebook cells that do `my_dict = run_vc_relax_until_converged(...)`
+#      keep working completely unchanged.
+# =============================================================================
+
+# --- vc_relax convex-hull workflow: restart-until-converged driver ---
+
 def run_vc_relax_until_converged(strucs_dict, base_input_data, pseudopotentials,
                                   calc_base_dir, runbatch_path, vdW_path=None,
-                                  max_restarts=8, poll_interval=3, logfile=sys.stdout):
+                                  max_restarts=8, poll_interval=3, logfile=sys.stdout,
+                                  return_failed=False):
     """
     Repeatedly runs vc_relax on every structure in strucs_dict, feeding each
     restart's relaxed geometry back in as the next restart's starting point,
@@ -251,19 +278,31 @@ def run_vc_relax_until_converged(strucs_dict, base_input_data, pseudopotentials,
     converged within max_restarts. Structures whose calculation crashed, or
     that didn't converge within max_restarts, are reported via `log` and
     simply left out of the returned dict rather than raising.
+
+    return_failed : if True, returns (results, failed_names) instead of just
+                     results, where failed_names is a list of structure names
+                     whose OUT file could not be read/parsed and were
+                     therefore disregarded. Default False.
     """
     log = Logger(logfile)
 
     # current_atoms holds each structure's LATEST known geometry -- the
-    # starting point for its next restart. converged/n_steps/results track
+    # starting point for its next restart. converged/results track
     # per-structure progress across restart rounds.
+    #
+    # FIX: added `failed`, parallel to `converged`. A structure that ends up
+    # in here is treated just like a converged one for the purpose of "don't
+    # resubmit it again" -- it just never makes it into `results`.
     current_atoms = dict(strucs_dict)
     converged = {name: False for name in strucs_dict}
+    failed = {name: False for name in strucs_dict}
     results = {}
 
     for restart in range(max_restarts):
-        # only (re)submit structures that haven't converged yet
-        names_this_round = [name for name in current_atoms if not converged[name]]
+        # only (re)submit structures that haven't converged AND haven't
+        # failed yet (FIX: added the "not failed[name]" half of this)
+        names_this_round = [name for name in current_atoms
+                             if not converged[name] and not failed[name]]
         if not names_this_round:
             break
 
@@ -303,35 +342,78 @@ def run_vc_relax_until_converged(strucs_dict, base_input_data, pseudopotentials,
                 log(f"  {name}: no OUT file found after restart {restart}, will retry.")
                 continue
 
-            with open(out_file) as f:
-                output = f.read()
+            # ------------------------------------------------------------
+            # FIX: everything below reads/interprets the OUT file, which
+            # can fail for reasons that are NOT "just resubmit it" (unlike
+            # the missing-file / missing-"JOB DONE" cases above) -- e.g. QE
+            # crashed mid-run but a "JOB DONE" from an earlier step is
+            # still in the file, the OUT file got truncated, or the
+            # forces/energy were never actually written. Wrapping this in
+            # try/except means one broken structure can no longer take
+            # down the whole run: we mark it failed, log why, and move on
+            # to the next structure.
+            # ------------------------------------------------------------
+            try:
+                with open(out_file) as f:
+                    output = f.read()
 
-            if "JOB DONE" not in output:
-                log(f"  {name}: 'JOB DONE' not found after restart {restart}, will retry.")
+                if "JOB DONE" not in output:
+                    log(f"  {name}: 'JOB DONE' not found after restart {restart}, will retry.")
+                    continue
+
+                # ASE returns one image per ionic/cell step vc_relax performed.
+                # Exactly one image means QE found the input geometry already
+                # converged in its very first SCF cycle -- this structure is done.
+                images = read(out_file, index=':', format='espresso-out')
+
+                if len(images) == 0:
+                    # belt-and-braces: shouldn't happen if "JOB DONE" is
+                    # present, but guard against it explicitly rather than
+                    # letting images[-1] below throw an IndexError
+                    raise ValueError("ASE parsed zero ionic/cell steps from an "
+                                      "OUT file that contained 'JOB DONE'.")
+
+                current_atoms[name] = images[-1]  # always carry the latest geometry forward
+
+                if len(images) <= 2:
+                    converged[name] = True
+                    results[name] = { 'ase_atoms' : images[-1],
+                                      'potential_energy' : images[-1].get_potential_energy(),
+                                      'forces' : images[-1].get_forces()}
+                    log(f"  {name}: converged after {restart + 1} restart(s).")
+                else:
+                    log(f"  {name}: {len(images)} ionic/cell steps this round, restarting.")
+
+            except Exception as e:
+                # FIX: this is the actual bug fix -- disregard this one
+                # structure instead of letting the exception propagate and
+                # kill the whole function. current_atoms[name] is left
+                # untouched on purpose: since failed[name] is now True, it
+                # will never be looked at again anyway.
+                failed[name] = True
+                log(f"  {name}: FAILED while reading/parsing OUT file after "
+                    f"restart {restart} -- disregarding this structure from "
+                    f"now on. ({type(e).__name__}: {e})")
                 continue
 
-            # ASE returns one image per ionic/cell step vc_relax performed.
-            # Exactly one image means QE found the input geometry already
-            # converged in its very first SCF cycle -- this structure is done.
-            images = read(out_file, index=':', format='espresso-out')
-            current_atoms[name] = images[-1]  # always carry the latest geometry forward
-
-            if len(images) <= 2:
-                converged[name] = True
-                results[name] = { 'ase_atoms' : images[-1],
-                                  'potential_energy' : images[-1].get_potential_energy(),
-                                  'forces' : images[-1].get_forces()}
-                log(f"  {name}: converged after {restart + 1} restart(s).")
-            else:
-                log(f"  {name}: {len(images)} ionic/cell steps this round, restarting.")
-
-    still_running = [name for name in current_atoms if not converged[name]]
+    still_running = [name for name in current_atoms
+                      if not converged[name] and not failed[name]]
     if still_running:
         log(f"WARNING: {len(still_running)} structure(s) did not converge within "
             f"{max_restarts} restarts: {still_running}")
 
+    failed_names = [name for name in failed if failed[name]]
+    if failed_names:
+        log(f"WARNING: {len(failed_names)} structure(s) were disregarded due to "
+            f"unreadable/corrupted OUT files: {failed_names}")
+
+    if return_failed:
+        return results, failed_names
     return results
 
+##########################################
+##### END OF run_vc_relax_until_converged() #####
+##########################################
 
 
 
