@@ -201,34 +201,9 @@ def get_ideal_sites(reference_atoms, cation='Li', anion='O'):
 
 
 ########################################################
-############### trajectory reading & site tracking ######
+###############  site tracking ######
 ########################################################
 
-##########################################
-##### START OF read_lammps_trajectory() ##
-##########################################
-
-#### INPUTS:
-# dump_path : path to a LAMMPS custom-style text dump (id type xu yu zu)
-# type_map  : dict mapping LAMMPS numeric type -> element symbol, e.g.
-#             {1: 'Li', 2: 'O'} -- must cover every type in the dump and
-#             use contiguous keys starting at 1.
-# index     : ASE frame-selection string, default ':' (every frame).
-#### RETURNS:
-# list of ASE.Atoms, one per dump frame, in chronological order, with
-# correct chemical symbols already assigned via type_map.
-
-def read_lammps_trajectory(dump_path, type_map, index=':'):
-    specorder = [type_map[t] for t in sorted(type_map)]
-    atoms_list = read(dump_path, index=index, format='lammps-dump-text',
-                       specorder=specorder)
-    if isinstance(atoms_list, Atoms):  # a single frame was selected
-        atoms_list = [atoms_list]
-    return atoms_list
-
-##########################################
-###### END OF read_lammps_trajectory() ###
-##########################################
 
 
 ##########################################

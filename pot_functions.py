@@ -475,10 +475,13 @@ def get_bulk_ref(structures, logfile=sys.stdout):
     # {element: (Composition, total_energy)} format
     element_ref_dict = {}
     for element, (atoms, energy_per_atom) in best_atoms_per_element.items():
-        structure = AseAtomsAdaptor.get_structure(atoms)
+        #structure = AseAtomsAdaptor.get_structure(atoms)
         total_energy = atoms.get_potential_energy()
-        element_ref_dict[element] = (structure.composition, total_energy)
-        log(f"{element} reference: {structure.composition.reduced_formula} "
+        #element_ref_dict[element] = (structure.composition, total_energy)
+        element_ref_dict[element] = (len(atoms), total_energy)
+        #log(f"{element} reference: {structure.composition.reduced_formula} "
+        #    f"({total_energy:.4f} eV total, {energy_per_atom:.4f} eV/atom)")
+        log(f"{element} reference: {len(atoms)} "
             f"({total_energy:.4f} eV total, {energy_per_atom:.4f} eV/atom)")
 
     return element_ref_dict
@@ -519,7 +522,7 @@ def get_bulk_ref(structures, logfile=sys.stdout):
 # input, key = "<index>_<chemical formula>"; for a dict input, key = the
 # same name you used in that dict.
 
-def get_formation_energy(structures, ref_bulk_dict, logfile=sys.stdout):
+def get_formation_energy(structures, ref_bulk_dict, logfile=sys.stdout, pw = False):
     log = Logger(logfile)
 
     # normalize the different accepted input styles into one
@@ -544,10 +547,11 @@ def get_formation_energy(structures, ref_bulk_dict, logfile=sys.stdout):
         else:
             n_units = len(atoms)
             log(f"{key}: no n_units given, taking total number of atoms instead!")
+        
+        if pw == False: #if pw calculation -> dont attach a calculator
+            atoms.calc = calc
 
-        atoms.calc = calc
         en_unit = atoms.get_potential_energy() / n_units
-
         counts = Counter(atoms.get_chemical_symbols())
 
         # make sure we have a reference energy for every element in this
@@ -564,7 +568,8 @@ def get_formation_energy(structures, ref_bulk_dict, logfile=sys.stdout):
         ref_e = 0
         for element, n_atoms in counts.items():
             composition, total_energy = ref_bulk_dict[element]
-            mu = total_energy / composition.num_atoms   # reference energy PER ATOM
+            #mu = total_energy / composition.num_atoms   # reference energy PER ATOM
+            mu = total_energy /  composition   # reference energy PER ATOM
             ref_e += (n_atoms / n_units) * mu
 
         results[key] = en_unit - ref_e

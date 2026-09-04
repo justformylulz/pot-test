@@ -17,10 +17,11 @@
 import os
 import sys
 import time
+import json
 import subprocess
 import numpy as np
 from invoke import run
-from ase.io import write
+from ase.io import read, write
 
 # reuse instead of duplicating: Logger just wraps print() so log messages
 # can be silenced (logfile=None) or redirected; is_nested tells single
@@ -69,7 +70,7 @@ def write_lammps_data(atoms, calc_path, elements=None, filename="structure.data"
 # START OF _ensemble_fix_line() #
 #################################
 
-# Builds the one "fix ens_fix all <ensemble> ..." line for a single MD
+# Builds the one "fix ens_fix <group> <ensemble> ..." line for a single MD
 # stage. Internal helper, not meant to be called directly -- used by
 # build_lammps_input().
 #
@@ -78,18 +79,29 @@ def write_lammps_data(atoms, calc_path, elements=None, filename="structure.data"
 # pressure : target pressure (used for npt/nph, ignored for nvt/nve)
 # tdamp/pdamp : thermostat/barostat damping times, in LAMMPS "metal"
 ####            units (picoseconds)
+# group    : which group of atoms this fix integrates -- "all" normally,
+####            "mobile" when freeze_below froze the bottom of the box
+####            (see build_lammps_input())
+# slab     : if True, npt/nph couple pressure in-plane only (x and y,
+####            separately from z) instead of the normal 3D-isotropic
+####            "iso" coupling -- appropriate once there's a frozen
+####            substrate + vacuum in z, where there's no real bulk
+####            pressure in z to control
 
-def _ensemble_fix_line(ensemble, temp, pressure, tdamp, pdamp):
+def _ensemble_fix_line(ensemble, temp, pressure, tdamp, pdamp, group='all', slab=False):
     ensemble = ensemble.lower()
 
+    press_coupling = (f"x {pressure} {pressure} {pdamp} y {pressure} {pressure} {pdamp}"
+                       if slab else f"iso {pressure} {pressure} {pdamp}")
+
     if ensemble == 'nvt':
-        return f"fix ens_fix all nvt temp {temp} {temp} {tdamp}"
+        return f"fix ens_fix {group} nvt temp {temp} {temp} {tdamp}"
     elif ensemble == 'npt':
-        return f"fix ens_fix all npt temp {temp} {temp} {tdamp} iso {pressure} {pressure} {pdamp}"
+        return f"fix ens_fix {group} npt temp {temp} {temp} {tdamp} {press_coupling}"
     elif ensemble == 'nph':
-        return f"fix ens_fix all nph iso {pressure} {pressure} {pdamp}"
+        return f"fix ens_fix {group} nph {press_coupling}"
     elif ensemble == 'nve':
-        return "fix ens_fix all nve"
+        return f"fix ens_fix {group} nve"
     else:
         raise ValueError(f"Unknown ensemble '{ensemble}', must be one of "
                           f"'nvt', 'npt', 'nph', 'nve'.")
@@ -129,6 +141,19 @@ def _ensemble_fix_line(ensemble, temp, pressure, tdamp, pdamp):
 ####             (pace_dump) is written
 #### traj_every  : how often (steps) the plain trajectory dump (dmp_trj)
 ####             is written
+#### freeze_below : thickness, in Angstrom, of a frozen slab at the
+####             bottom of the box (measured from the box's current zlo)
+####             -- e.g. for surface simulations, to keep a few layers of
+####             substrate fixed in place. None (default) freezes
+####             nothing, and reproduces the old bulk-MD behaviour
+####             exactly. When set: those atoms get zero force every step
+####             (so they never move), everything else (thermostat,
+####             barostat, initial velocities) only acts on the
+####             remaining "mobile" atoms, and the box-relax/NPT-NPH
+####             pressure coupling switches from full 3D "iso" to
+####             in-plane-only (x and y separately, z untouched) -- there
+####             is no real bulk pressure to control in z once there's a
+####             frozen substrate and vacuum there.
 #
 # RETURNS:
 #### (input_text, seed) -- the finished input script text, and the seed
@@ -140,7 +165,7 @@ def build_lammps_input(data_path, elements, pot_path, stages,
                         yaml_name="output_potential.yaml",
                         asi_name="output_potential.asi",
                         timestep=0.001, tdamp=None, pdamp=None, seed=None,
-                        gamma_every=2000, traj_every=2000):
+                        gamma_every=2000, traj_every=200, freeze_below=None):
 
     if tdamp is None:
         tdamp = 100 * timestep
@@ -166,10 +191,19 @@ def build_lammps_input(data_path, elements, pot_path, stages,
         raise ValueError("None of the stages specify a 'temp' -- at least "
                           "one is needed to generate the initial velocities.")
 
-    # This is your template, verbatim, with only the bracketed bits filled
-    # in. NOTE: the box-relax step always targets zero pressure (iso 0.0),
-    # regardless of what pressure the actual MD stages target further down
-    # -- that's what your template said, so it's kept fixed here too.
+    slab = freeze_below is not None
+    integrate_group = 'mobile' if slab else 'all'
+    freeze_block = ""
+    if slab:
+        freeze_block = f"""
+region frozen_region block INF INF INF INF EDGE $(zlo+{freeze_below}) units box
+group frozen region frozen_region
+group mobile subtract all frozen
+compute mobile_temp mobile temp
+fix freeze frozen setforce 0.0 0.0 0.0
+"""
+
+
     header = f"""units metal
 atom_style atomic
 boundary p p p
@@ -192,19 +226,21 @@ thermo 100
 thermo_style custom step temp press vol etotal ke pe lz cpu
 timestep {timestep}
 
+min_style cg
+minimize 1.0e-10 1.0e-10 1000000 1000000
+run 1
+
+{freeze_block}
+
+
 variable T equal temp
 variable P equal press
 variable V equal vol
-fix vpt_dump all ave/time 100 1 100 v_V v_P v_T file vpt.dat
+fix vpt_dump {integrate_group} ave/time 100 1 100 v_V v_P v_T file vpt.dat
 
-min_style cg
-fix rel_box all box/relax iso 0.0
-minimize 1.0e-15 1.0e-15 1000000 1000000
-run 101
-unfix rel_box
 
-velocity all create {init_temp} {seed} mom yes rot yes dist gaussian
-fix mom_fix all momentum 1 linear 1 1 1
+velocity {integrate_group} create {init_temp} {seed} mom yes rot yes dist gaussian
+fix mom_fix {integrate_group} momentum 1 linear 1 1 1
 """
 
     # one fix/run/unfix block per requested stage -- unfixing ens_fix
@@ -217,7 +253,8 @@ fix mom_fix all momentum 1 linear 1 1 1
         pressure = stage.get('pressure', 0.0)
         nsteps = stage['nsteps']
 
-        stage_lines.append(_ensemble_fix_line(ensemble, temp, pressure, tdamp, pdamp))
+        stage_lines.append(_ensemble_fix_line(ensemble, temp, pressure, tdamp, pdamp,
+                                               group=integrate_group, slab=slab))
         stage_lines.append(f"run {nsteps}")
         stage_lines.append("unfix ens_fix")
         stage_lines.append("")  # blank line between stages, purely cosmetic
@@ -258,19 +295,23 @@ fix mom_fix all momentum 1 linear 1 1 1
 #### elements     : LAMMPS atom-type order, see write_lammps_data(). If
 ####                None, it's worked out automatically from `atoms`.
 #### timestep, tdamp, pdamp, seed, yaml_name, asi_name, gamma_every,
-#### traj_every   : forwarded to build_lammps_input(), see there for what
-####                they do.
+#### traj_every, freeze_below : forwarded to build_lammps_input(), see
+####                there for what they do.
 #
 # RETURNS:
 #### dict {'job_id': ..., 'directory': ...} -- same shape as run_pw()
-#### returns, so it can be handed straight to read_lammps_jobs().
+#### returns, so it can be handed straight to read_lammps_jobs(). This
+#### dict is also saved as "job.json" inside calc_path, so you can hand
+#### THAT file's path to read_lammps_jobs() later instead, even after
+#### this notebook session (and the dict in memory) is long gone.
 
-def run_lammps_md(atoms, temp, pot_path, calc_path, runbatch_path,
-                   pressure=0.0, ensemble='npt', nsteps=10000,
+def run_lammps_md(atoms, temp, pot_path, calc_path, runbatch_path, freeze_below=None, 
+                   pressure=0.0, ensemble='nvt', nsteps=10000,
                    elements=None, timestep=0.001, tdamp=None, pdamp=None,
                    seed=None, yaml_name="output_potential.yaml",
                    asi_name="output_potential.asi",
-                   gamma_every=2000, traj_every=2000, logfile=sys.stdout):
+                   gamma_every=2000, traj_every=200,
+                   logfile=sys.stdout):
 
     log = Logger(logfile)
 
@@ -304,7 +345,8 @@ def run_lammps_md(atoms, temp, pot_path, calc_path, runbatch_path,
         data_path, elements, pot_path, stages,
         yaml_name=yaml_name, asi_name=asi_name, timestep=timestep,
         tdamp=tdamp, pdamp=pdamp, seed=seed,
-        gamma_every=gamma_every, traj_every=traj_every)
+        gamma_every=gamma_every, traj_every=traj_every,
+        freeze_below=freeze_below)
 
     log(f"  seed used for velocity create: {seed}")
 
@@ -321,6 +363,11 @@ def run_lammps_md(atoms, temp, pot_path, calc_path, runbatch_path,
 
     job = {'job_id': job_id, 'directory': calc_path}
 
+    # save the job dict to disk too, so read_lammps_jobs() can be pointed
+    # at this file later instead of needing the `job` dict kept in memory
+    with open(os.path.join(calc_path, "job.json"), mode='w') as f:
+        json.dump(job, f, indent=2)
+
     return job
 
 #################################
@@ -329,14 +376,110 @@ def run_lammps_md(atoms, temp, pot_path, calc_path, runbatch_path,
 
 
 #################################
+## START OF run_multiple_lammps_md() ##
+#################################
+
+# Submits several LAMMPS MD runs at once -- the LAMMPS equivalent of
+# run_multiple_pw(). Unlike run_multiple_pw() (which reuses the exact same
+# settings for every structure), each job here can independently override
+# any setting, so this covers "same structure, several temperatures",
+# "several structures, same settings", or any mix of the two.
+#
+# INPUTS:
+#### jobs_spec : list of dicts, one per job. Each dict MUST have an
+####             'atoms' key (the ASE Atoms object for that job), and MAY
+####             have any of 'name', 'temp', 'pressure', 'ensemble',
+####             'nsteps', 'elements', 'timestep', 'tdamp', 'pdamp',
+####             'seed', 'yaml_name', 'asi_name', 'gamma_every',
+####             'traj_every', 'freeze_below' -- these override the
+####             shared default of the same name (below) for that one
+####             job only. E.g.:
+####             [{'atoms': atoms1, 'temp': 300},
+####              {'atoms': atoms1, 'temp': 600},
+####              {'atoms': atoms2, 'temp': 300}]
+#### 'name'    : subdirectory name for that job, under calc_path. If not
+####             given, defaults to "job_0", "job_1", ... in list order.
+#### pot_path, calc_path, runbatch_path, temp, pressure, ensemble, nsteps,
+#### elements, timestep, tdamp, pdamp, seed, yaml_name, asi_name,
+#### gamma_every, traj_every, freeze_below : shared defaults, used for
+####             any job that doesn't override them in its own dict. Same
+####             meaning as in run_lammps_md(), see there for details.
+#
+# RETURNS:
+#### nested dict {name: {'job_id': ..., 'directory': ...}, ...}, one entry
+#### per job, keyed by each job's name -- same shape read_lammps_jobs()
+#### already expects for a batch of jobs. This dict is also saved as
+#### "jobs.json" inside calc_path (the shared parent directory, not the
+#### individual job subdirectories), so you can hand THAT file's path to
+#### read_lammps_jobs() later instead, even after this notebook session
+#### (and the dict in memory) is long gone.
+
+def run_multiple_lammps_md(jobs_spec, pot_path, calc_path, runbatch_path,
+                            temp=None, pressure=0.0, ensemble='npt', nsteps=10000,
+                            elements=None, timestep=0.001, tdamp=None, pdamp=None,
+                            seed=None, yaml_name="output_potential.yaml",
+                            asi_name="output_potential.asi",
+                            gamma_every=2000, traj_every=200, freeze_below=None,
+                            logfile=sys.stdout):
+
+    log = Logger(logfile)
+
+    jobs = {}
+    for i, spec in enumerate(jobs_spec):
+        if 'atoms' not in spec:
+            raise ValueError(f"jobs_spec[{i}] is missing the required 'atoms' key.")
+
+        name = spec.get('name', f"job_{i}")
+        job_calc_path = os.path.join(calc_path, name)
+
+        log(f"submitting '{name}'...")
+
+        job = run_lammps_md(
+            spec['atoms'], spec.get('temp', temp), pot_path, job_calc_path,
+            runbatch_path,
+            pressure=spec.get('pressure', pressure),
+            ensemble=spec.get('ensemble', ensemble),
+            nsteps=spec.get('nsteps', nsteps),
+            elements=spec.get('elements', elements),
+            timestep=spec.get('timestep', timestep),
+            tdamp=spec.get('tdamp', tdamp),
+            pdamp=spec.get('pdamp', pdamp),
+            seed=spec.get('seed', seed),
+            yaml_name=spec.get('yaml_name', yaml_name),
+            asi_name=spec.get('asi_name', asi_name),
+            gamma_every=spec.get('gamma_every', gamma_every),
+            traj_every=spec.get('traj_every', traj_every),
+            freeze_below=spec.get('freeze_below', freeze_below),
+            logfile=logfile)
+
+        jobs[name] = job
+
+    # save the whole batch to disk too, so read_lammps_jobs() can be
+    # pointed at this file later instead of needing the `jobs` dict kept
+    # in memory (this file lives in calc_path itself, not a job subdir)
+    run(f"mkdir -p {calc_path}")
+    with open(os.path.join(calc_path, "jobs.json"), mode='w') as f:
+        json.dump(jobs, f, indent=2)
+
+    return jobs
+
+#################################
+### END OF run_multiple_lammps_md() ###
+#################################
+
+
+#################################
 ### START OF read_lammps_jobs() #
 #################################
 
 # Waits for one or several LAMMPS SLURM jobs (as returned by
-# run_lammps_md()) to leave the queue, then checks whether each one
-# actually finished cleanly: LAMMPS prints "Total wall time:" as its very
-# last line on a normal exit -- if that's missing, something went wrong
-# (crash, hit the walltime, ...).
+# run_lammps_md()/run_multiple_lammps_md(), or saved by them to a
+# "job.json"/"jobs.json" file) to leave the queue, then checks whether
+# each one actually finished cleanly: LAMMPS prints "Total wall time:" as
+# its very last line on a normal exit -- if that's missing, something
+# went wrong (crash, hit the walltime, ...). For every job that DID
+# finish cleanly, the last frame of its trajectory dump is read in as an
+# ASE Atoms object.
 #
 # ASSUMPTION: your runbatch script writes LAMMPS' log to a file called
 # "log.lammps" inside calc_path (LAMMPS' own default log filename). If
@@ -344,16 +487,32 @@ def run_lammps_md(atoms, temp, pot_path, calc_path, runbatch_path,
 # the QE runs), pass that name as `log_filename`.
 #
 # INPUTS:
-#### jobs : one job dict, or a nested dict of them (same shape read_pw_jobs()
-####        takes)
+#### jobs : one job dict, a nested dict of them (same shape read_pw_jobs()
+####        takes), OR a path (string) to a "job.json"/"jobs.json" file
+####        saved earlier by run_lammps_md()/run_multiple_lammps_md() --
+####        handy for reading back jobs from an earlier notebook session,
+####        without needing the dict kept around in memory.
+#### traj_filename : name of the trajectory dump to read the final
+####        structure from (the "trj.lammpstrj" dump written by
+####        build_lammps_input(); it already has an "element" column, so
+####        no elements/specorder needs to be passed in here).
 #
 # RETURNS:
-#### nothing -- this just logs which jobs finished cleanly and which
-#### didn't. Read the actual trajectory/log files afterwards yourself,
-#### e.g. with read_lammps_trajectory() from frenkel.py.
+#### list of ASE Atoms objects -- the final structure of every job that
+#### finished cleanly, in the same order the jobs were given. Jobs that
+#### never started or didn't finish cleanly are skipped (with a log
+#### message explaining why), so the list can be shorter than the number
+#### of jobs you passed in.
 
-def read_lammps_jobs(jobs, log_filename="log.lammps", poll_interval=3, logfile=sys.stdout):
+def read_lammps_jobs(jobs, log_filename="log.lammps", traj_filename="trj.lammpstrj",
+                      poll_interval=3, logfile=sys.stdout):
     log = Logger(logfile)
+
+    # a path to a saved "job.json"/"jobs.json" file was given instead of
+    # an actual dict -- load it first, then carry on exactly as before
+    if isinstance(jobs, str):
+        with open(jobs) as f:
+            jobs = json.load(f)
 
     jobid_list = []
     dirs_list = []
@@ -365,6 +524,8 @@ def read_lammps_jobs(jobs, log_filename="log.lammps", poll_interval=3, logfile=s
     else:
         jobid_list.append(jobs['job_id'])
         dirs_list.append(jobs['directory'])
+
+    atoms_list = []
 
     for i in range(len(jobid_list)):
         calc_path = dirs_list[i]
@@ -399,8 +560,16 @@ def read_lammps_jobs(jobs, log_filename="log.lammps", poll_interval=3, logfile=s
             log(f"  {calc_path}: LAMMPS did not finish normally (no 'Total "
                 f"wall time' found in {log_filename}) -- check {log_path} "
                 f"for errors.")
-        else:
-            log(f"  {calc_path}: finished normally.")
+            continue
+
+        log(f"  {calc_path}: finished normally.")
+
+        traj_path = os.path.join(calc_path, traj_filename)
+        atoms = read(traj_path, index=':', format='lammps-dump-text')
+        atoms_list.append(atoms)
+
+    return atoms_list
+
 
 #################################
 #### END OF read_lammps_jobs() ##
